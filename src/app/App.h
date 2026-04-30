@@ -194,6 +194,9 @@ class App {
   String typographyTuningLabel() const;
   String typographyTuningValueLabel() const;
   String uiText(UiText key) const;
+  void lookupCurrentWord(uint32_t nowMs);
+  void dismissLookup(uint32_t nowMs);
+  static String extractWordForLookup(const String &word);
   void openBookPicker();
   void selectBookPickerItem(uint32_t nowMs);
   void openChapterPicker();
@@ -315,6 +318,13 @@ class App {
   uint16_t lastReaderTapY_ = 0;
   bool touchInitialized_ = false;
   bool touchPlayHeld_ = false;
+  uint32_t touchPlayHeldStartMs_ = 0;
+  uint16_t touchPlayHeldStartX_ = 0;
+  uint16_t touchPlayHeldStartY_ = 0;
+  bool lookupViewVisible_ = false;
+  String lookupWord_;
+  String lookupPartOfSpeech_;
+  String lookupDefinition_;
   bool playLocked_ = false;
   bool pauseAtSentenceEndRequested_ = false;
   bool lastReaderTapValid_ = false;

@@ -2,7 +2,9 @@
 
 #include <esp_sleep.h>
 #include <esp_log.h>
+#include <HTTPClient.h>
 #include <WiFi.h>
+#include <WiFiClientSecure.h>
 #include <algorithm>
 #include <cstdio>
 #include <iterator>
@@ -10,6 +12,7 @@
 #include <vector>
 
 #include "board/BoardConfig.h"
+#include "text/LatinText.h"
 
 #ifndef RSVP_USB_TRANSFER_ENABLED
 #define RSVP_USB_TRANSFER_ENABLED 0
@@ -26,6 +29,7 @@ constexpr uint32_t kPowerOffHoldMs = 1600;
 constexpr uint32_t kPowerOffReleaseWaitMs = 4000;
 constexpr uint32_t kBatterySampleIntervalMs = 180000;
 constexpr uint32_t kTouchPlayHoldMs = 180;
+constexpr uint32_t kWordLookupHoldMs = 1500;
 constexpr uint32_t kPreviewBrowseHoldMs = 240;
 constexpr uint32_t kReaderDoubleTapWindowMs = 320;
 constexpr uint32_t kThemeToggleHoldMs = 900;
@@ -358,6 +362,89 @@ uint16_t loadPacingDelayMs(Preferences &preferences, const char *key, const char
   return kDefaultPacingDelayMs;
 }
 
+// Extract the first JSON string value for a given key. Handles basic escape sequences.
+bool extractFirstJsonString(const String &json, const char *key, String &value) {
+  const String pattern = "\"" + String(key) + "\":\"";
+  const int patternIdx = json.indexOf(pattern);
+  if (patternIdx < 0) {
+    return false;
+  }
+
+  const int start = patternIdx + static_cast<int>(pattern.length());
+  String result;
+  bool escaping = false;
+  for (int i = start; i < static_cast<int>(json.length()); ++i) {
+    const char c = json[i];
+    if (escaping) {
+      switch (c) {
+        case '"':
+        case '\\':
+        case '/':
+          result += c;
+          break;
+        case 'n':
+          result += '\n';
+          break;
+        case 't':
+          result += '\t';
+          break;
+        default:
+          result += c;
+          break;
+      }
+      escaping = false;
+    } else if (c == '\\') {
+      escaping = true;
+    } else if (c == '"') {
+      value = result;
+      return true;
+    } else {
+      result += c;
+    }
+  }
+  return false;
+}
+
+// Read up to maxBytes from an HTTP response body.
+String readDictBodyLimited(HTTPClient &http, size_t maxBytes) {
+  WiFiClient *stream = http.getStreamPtr();
+  if (stream == nullptr) {
+    return "";
+  }
+
+  String body;
+  const size_t reportedSize = static_cast<size_t>(std::max(0, http.getSize()));
+  const size_t reserveBytes =
+      reportedSize > 0 ? std::min(reportedSize, maxBytes) : 1024;
+  body.reserve(reserveBytes);
+
+  uint8_t buffer[256];
+  size_t totalRead = 0;
+  const uint32_t startMs = millis();
+  while ((http.connected() || stream->available()) && totalRead < maxBytes) {
+    if (millis() - startMs > 8000) {
+      break;
+    }
+    const int available = stream->available();
+    if (available <= 0) {
+      delay(1);
+      continue;
+    }
+    const size_t remaining = maxBytes - totalRead;
+    const size_t chunkSize =
+        std::min(remaining, std::min(sizeof(buffer), static_cast<size_t>(available)));
+    const int bytesRead = stream->readBytes(buffer, chunkSize);
+    if (bytesRead <= 0) {
+      break;
+    }
+    totalRead += static_cast<size_t>(bytesRead);
+    for (int i = 0; i < bytesRead; ++i) {
+      body += static_cast<char>(buffer[i]);
+    }
+  }
+  return body;
+}
+
 }  // namespace
 
 App::App() : button_(BoardConfig::PIN_BOOT_BUTTON), powerButton_(BoardConfig::PIN_PWR_BUTTON) {}
@@ -563,6 +650,7 @@ void App::setState(AppState nextState, uint32_t nowMs) {
   }
   if (nextState != AppState::Paused && nextState != AppState::Playing) {
     resetReaderTapTracking();
+    lookupViewVisible_ = false;
   }
 
   state_ = nextState;
@@ -1059,6 +1147,121 @@ void App::finalizeReaderPause(uint32_t nowMs) {
   setState(AppState::Paused, nowMs);
 }
 
+String App::extractWordForLookup(const String &word) {
+  String clean;
+  for (size_t i = 0; i < word.length(); ++i) {
+    const uint8_t c = static_cast<uint8_t>(word[i]);
+    const uint8_t lower = LatinText::toLowercaseByte(c);
+    if (lower >= 'a' && lower <= 'z') {
+      clean += static_cast<char>(lower);
+    }
+  }
+  return clean;
+}
+
+void App::lookupCurrentWord(uint32_t nowMs) {
+  const String word = extractWordForLookup(reader_.currentWord());
+  if (word.isEmpty()) {
+    return;
+  }
+
+  lookupWord_ = word;
+  lookupPartOfSpeech_ = "";
+  lookupDefinition_ = "";
+
+  display_.renderStatus(word, "Looking up...", "");
+
+  const String ssid = preferences_.getString(kPrefWifiSsid, "");
+  if (ssid.isEmpty()) {
+    lookupDefinition_ = "No WiFi configured";
+    lookupViewVisible_ = true;
+    display_.renderDefinition(lookupWord_, lookupPartOfSpeech_, lookupDefinition_);
+    Serial.printf("[lookup] no wifi configured for word: %s\n", word.c_str());
+    return;
+  }
+
+  const String pass = preferences_.getString(kPrefWifiPass, "");
+  WiFi.persistent(false);
+  WiFi.setAutoReconnect(false);
+  WiFi.mode(WIFI_STA);
+  WiFi.begin(ssid.c_str(), pass.c_str());
+
+  constexpr uint32_t kWifiTimeoutMs = 10000;
+  constexpr uint32_t kWifiPollMs = 250;
+  const uint32_t wifiStartMs = millis();
+  while (WiFi.status() != WL_CONNECTED && millis() - wifiStartMs < kWifiTimeoutMs) {
+    delay(kWifiPollMs);
+    display_.renderStatus(word, "Connecting WiFi...", ssid);
+  }
+
+  if (WiFi.status() != WL_CONNECTED) {
+    WiFi.disconnect(true, false);
+    WiFi.mode(WIFI_OFF);
+    lookupDefinition_ = "Could not connect to WiFi";
+    lookupViewVisible_ = true;
+    display_.renderDefinition(lookupWord_, lookupPartOfSpeech_, lookupDefinition_);
+    Serial.printf("[lookup] wifi connect failed for word: %s\n", word.c_str());
+    return;
+  }
+
+  Serial.printf("[lookup] wifi connected, looking up: %s\n", word.c_str());
+  display_.renderStatus(word, "Fetching definition...", "");
+
+  const String url =
+      "https://api.dictionaryapi.dev/api/v2/entries/en/" + word;
+  WiFiClientSecure client;
+  client.setInsecure();
+  client.setHandshakeTimeout(10);
+
+  HTTPClient http;
+  http.setTimeout(8000);
+  if (http.begin(client, url)) {
+    const int code = http.GET();
+    if (code == HTTP_CODE_OK) {
+      const String body = readDictBodyLimited(http, 8192);
+      http.end();
+      String partOfSpeech;
+      String definition;
+      extractFirstJsonString(body, "partOfSpeech", partOfSpeech);
+      extractFirstJsonString(body, "definition", definition);
+
+      if (!definition.isEmpty()) {
+        lookupPartOfSpeech_ = partOfSpeech;
+        lookupDefinition_ = definition;
+      } else {
+        lookupDefinition_ = "No definition found";
+      }
+      Serial.printf("[lookup] result: %s / %s\n", partOfSpeech.c_str(), definition.c_str());
+    } else if (code == HTTP_CODE_NOT_FOUND) {
+      http.end();
+      lookupDefinition_ = "Word not found";
+      Serial.printf("[lookup] 404 for word: %s\n", word.c_str());
+    } else {
+      http.end();
+      lookupDefinition_ = "Network error (" + String(code) + ")";
+      Serial.printf("[lookup] HTTP error %d for word: %s\n", code, word.c_str());
+    }
+  } else {
+    lookupDefinition_ = "Request failed";
+    Serial.printf("[lookup] http.begin failed for word: %s\n", word.c_str());
+  }
+
+  WiFi.disconnect(true, false);
+  WiFi.mode(WIFI_OFF);
+
+  lookupViewVisible_ = true;
+  display_.renderDefinition(lookupWord_, lookupPartOfSpeech_, lookupDefinition_);
+  (void)nowMs;
+}
+
+void App::dismissLookup(uint32_t nowMs) {
+  lookupViewVisible_ = false;
+  lookupWord_ = "";
+  lookupPartOfSpeech_ = "";
+  lookupDefinition_ = "";
+  renderActiveReader(nowMs);
+}
+
 void App::handleTouch(uint32_t nowMs) {
   if (!touchInitialized_) {
     return;
@@ -1090,12 +1293,38 @@ void App::handleTouch(uint32_t nowMs) {
 }
 
 void App::applyPausedTouchGesture(const TouchEvent &event, uint32_t nowMs) {
+  // If the dictionary lookup overlay is visible, any touch end dismisses it.
+  if (lookupViewVisible_) {
+    if (event.phase == TouchPhase::End) {
+      dismissLookup(nowMs);
+    }
+    return;
+  }
+
   if (event.phase == TouchPhase::End && touchPlayHeld_) {
     resetReaderTapTracking();
     pausedTouch_.active = false;
     pausedTouchIntent_ = TouchIntent::None;
     requestReaderPauseAtSentenceEnd(nowMs);
     return;
+  }
+
+  // Long hold (kWordLookupHoldMs) while playing via hold gesture: look up the current word.
+  if (state_ == AppState::Playing && touchPlayHeld_ && event.phase != TouchPhase::End) {
+    const int holdDeltaX =
+        abs(static_cast<int>(event.x) - static_cast<int>(touchPlayHeldStartX_));
+    const int holdDeltaY =
+        abs(static_cast<int>(event.y) - static_cast<int>(touchPlayHeldStartY_));
+    if (holdDeltaX <= static_cast<int>(kTapSlopPx) &&
+        holdDeltaY <= static_cast<int>(kTapSlopPx) &&
+        nowMs - touchPlayHeldStartMs_ >= kWordLookupHoldMs) {
+      resetReaderTapTracking();
+      pausedTouch_.active = false;
+      pausedTouchIntent_ = TouchIntent::None;
+      finalizeReaderPause(nowMs);
+      lookupCurrentWord(nowMs);
+      return;
+    }
   }
 
   if (event.phase == TouchPhase::Start) {
@@ -1160,6 +1389,9 @@ void App::applyPausedTouchGesture(const TouchEvent &event, uint32_t nowMs) {
       pressDurationMs >= kTouchPlayHoldMs && tapLike) {
     resetReaderTapTracking();
     touchPlayHeld_ = true;
+    touchPlayHeldStartMs_ = nowMs;
+    touchPlayHeldStartX_ = pausedTouch_.startX;
+    touchPlayHeldStartY_ = pausedTouch_.startY;
     pausedTouchIntent_ = TouchIntent::PlayHold;
     wpmFeedbackVisible_ = false;
     setState(AppState::Playing, nowMs);

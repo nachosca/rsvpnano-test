@@ -2706,6 +2706,90 @@ void DisplayManager::renderTextEntry(const String &title, const String &prompt, 
   flushScaledFrame(scale, virtualWidth, virtualHeight);
 }
 
+void DisplayManager::renderDefinition(const String &word, const String &partOfSpeech,
+                                      const String &definition) {
+  const String renderKey = "def|" + word + "|" + partOfSpeech + "|" + definition + "|b:" +
+                           batteryLabel_ + "|d:" + String(darkMode_ ? 1 : 0) + "|n:" +
+                           String(nightMode_ ? 1 : 0);
+  if (!initialized_ || renderKey == lastRenderKey_) {
+    return;
+  }
+  lastRenderKey_ = renderKey;
+
+  const int scale = 1;
+  const int virtualWidth = kDisplayWidth;
+  const int virtualHeight = kDisplayHeight;
+  const int marginX = kScrollMarginX;
+  const int maxTextWidth = virtualWidth - 2 * marginX;
+  const int serifDivisor = 2;
+  const int serifGlyphHeight =
+      baseGlyphHeightForTypeface(effectiveReaderTypefaceForText(word)) / serifDivisor;
+  const int tinyLineH = kTinyGlyphHeight * kTinyScale + 4;
+  const int hintH = kTinyGlyphHeight;
+
+  const int wordY = 8;
+  const int posY = wordY + serifGlyphHeight + 8;
+  const int def1Y = posY + kTinyGlyphHeight * kTinyScale + 8;
+  const int hintY = virtualHeight - hintH - 4;
+
+  clearVirtualBuffer(virtualWidth, virtualHeight);
+
+  // Draw the word in medium serif (50% of full size)
+  const String fittedWord = fitSerifText(word, maxTextWidth, serifDivisor);
+  const int wordWidth = measureSerifTextWidth(fittedWord, serifDivisor);
+  const int wordX = std::max(marginX, (virtualWidth - wordWidth) / 2);
+  drawSerifTextAt(fittedWord, wordX, wordY, wordColor(), serifDivisor);
+
+  // Draw part of speech in dim
+  if (!partOfSpeech.isEmpty()) {
+    const String pos = fitTinyText(partOfSpeech, maxTextWidth, kTinyScale);
+    drawTinyTextAt(pos, marginX, posY, dimColor(), kTinyScale);
+  }
+
+  // Word-wrap the definition into available lines
+  int lineY = def1Y;
+  int pos = 0;
+  const int defLen = static_cast<int>(definition.length());
+  while (pos < defLen && lineY + kTinyGlyphHeight * kTinyScale <= hintY - 4) {
+    // Binary-search how many characters fit on this line
+    int lineEnd = pos + 1;
+    int hi = defLen;
+    while (lineEnd < hi) {
+      const int mid = (lineEnd + hi + 1) / 2;
+      if (measureTinyTextWidth(definition.substring(pos, mid), kTinyScale) <= maxTextWidth) {
+        lineEnd = mid;
+      } else {
+        hi = mid - 1;
+      }
+    }
+
+    // Break at a word boundary if not at the end of the text
+    if (lineEnd < defLen) {
+      int breakAt = lineEnd;
+      while (breakAt > pos && definition[breakAt] != ' ') {
+        --breakAt;
+      }
+      if (breakAt > pos) {
+        lineEnd = breakAt;
+      }
+    }
+
+    drawTinyTextAt(definition.substring(pos, lineEnd), marginX, lineY, wordColor(), kTinyScale);
+    lineY += tinyLineH;
+
+    pos = lineEnd;
+    while (pos < defLen && definition[pos] == ' ') {
+      ++pos;
+    }
+  }
+
+  // "Tap to dismiss" hint at the bottom
+  drawTinyTextCentered(fitTinyText("Tap to dismiss", maxTextWidth, 1), hintY, footerColor(), 1);
+
+  drawBatteryBadge();
+  flushScaledFrame(scale, virtualWidth, virtualHeight);
+}
+
 void DisplayManager::renderStatus(const String &title, const String &line1, const String &line2) {
   const String renderKey = "status|" + title + "|" + line1 + "|" + line2 + "|b:" +
                            batteryLabel_ + "|d:" + String(darkMode_ ? 1 : 0) + "|n:" +

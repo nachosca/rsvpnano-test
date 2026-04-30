@@ -87,6 +87,8 @@ class DisplayManager {
   void renderLibrary(const std::vector<LibraryItem> &items, size_t selectedIndex);
   void renderTextEntry(const String &title, const String &prompt, const String &value,
                        const String &helperText, const std::vector<Button> &buttons);
+  void renderDefinition(const String &word, const String &partOfSpeech,
+                        const String &definition);
   void renderStatus(const String &title, const String &line1 = "", const String &line2 = "");
   void renderProgress(const String &title, const String &line1 = "", const String &line2 = "",
                       int progressPercent = -1);
