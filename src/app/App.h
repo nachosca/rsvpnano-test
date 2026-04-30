@@ -194,7 +194,7 @@ class App {
   String typographyTuningLabel() const;
   String typographyTuningValueLabel() const;
   String uiText(UiText key) const;
-  void lookupCurrentWord(uint32_t nowMs);
+  void lookupCurrentWord();
   void dismissLookup(uint32_t nowMs);
   static String extractWordForLookup(const String &word);
   void openBookPicker();

@@ -1159,7 +1159,7 @@ String App::extractWordForLookup(const String &word) {
   return clean;
 }
 
-void App::lookupCurrentWord(uint32_t nowMs) {
+void App::lookupCurrentWord() {
   const String word = extractWordForLookup(reader_.currentWord());
   if (word.isEmpty()) {
     return;
@@ -1210,6 +1210,9 @@ void App::lookupCurrentWord(uint32_t nowMs) {
   const String url =
       "https://api.dictionaryapi.dev/api/v2/entries/en/" + word;
   WiFiClientSecure client;
+  // Certificate validation is intentionally skipped here (same approach as the OTA updater) since
+  // the dictionaryapi.dev certificate chain may vary by CDN node. Definition lookups transmit no
+  // sensitive data, making this an acceptable trade-off.
   client.setInsecure();
   client.setHandshakeTimeout(10);
 
@@ -1251,7 +1254,6 @@ void App::lookupCurrentWord(uint32_t nowMs) {
 
   lookupViewVisible_ = true;
   display_.renderDefinition(lookupWord_, lookupPartOfSpeech_, lookupDefinition_);
-  (void)nowMs;
 }
 
 void App::dismissLookup(uint32_t nowMs) {
@@ -1322,7 +1324,7 @@ void App::applyPausedTouchGesture(const TouchEvent &event, uint32_t nowMs) {
       pausedTouch_.active = false;
       pausedTouchIntent_ = TouchIntent::None;
       finalizeReaderPause(nowMs);
-      lookupCurrentWord(nowMs);
+      lookupCurrentWord();
       return;
     }
   }
